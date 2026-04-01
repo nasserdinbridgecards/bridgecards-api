@@ -33,29 +33,24 @@ async function getToken() {
   return d.access_token;
 }
 
-// Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', sandbox: SANDBOX });
 });
 
-// Stripe publishable key
 app.get('/api/stripe-key', (req, res) => {
   res.json({ publishableKey: STRIPE_PUB });
 });
 
-// Create Stripe Payment Intent
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
     const { amount, currency = 'usd', email } = req.body;
     if (!amount) return res.status(400).json({ error: 'amount required' });
-
     const body = new URLSearchParams({
       amount: String(Math.round(amount * 100)),
       currency,
       'payment_method_types[]': 'card',
       'metadata[customer_email]': email || '',
     });
-
     const response = await fetch('https://api.stripe.com/v1/payment_intents', {
       method: 'POST',
       headers: {
@@ -72,33 +67,23 @@ app.post('/api/create-payment-intent', async (req, res) => {
   }
 });
 
-// Get product denominations from Reloadly (to get correct unitPrice)
-app.get('/api/product/:id/denominations', async (req, res) => {
-  try {
-    const token = await getToken();
-    const response = await fetch(`${RL_BASE}/products/${req.params.id}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/com.reloadly.giftcards-v1+json',
-      },
-    });
-    const product = await response.json();
-    res.json(product);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Place Reloadly order
 app.post('/api/order', async (req, res) => {
   try {
     const { productId, quantity, unitPrice, recipientEmail, paymentIntentId } = req.body;
 
-    if (!productId || !quantity || !unitPrice || !recipientEmail) {
+    console.log('ORDER REQUEST:', { productId, quantity, unitPrice, recipientEmail });
+
+    const numericProductId = parseInt(productId);
+    if (isNaN(numericProductId)) {
+      return res.status(400).json({
+        error: `المنتج "${productId}" غير متوفر في Reloadly حالياً. اختر منتجاً آخر.`
+      });
+    }
+
+    if (!quantity || !unitPrice || !recipientEmail) {
       return res.status(400).json({ error: 'Missing fields' });
     }
 
-    // Verify Stripe payment if provided
     if (paymentIntentId) {
       const piRes = await fetch(
         `https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
@@ -112,33 +97,45 @@ app.post('/api/order', async (req, res) => {
 
     const token = await getToken();
 
-    // Get correct unitPrice from Reloadly
-    let finalUnitPrice = unitPrice;
+    let finalUnitPrice = parseFloat(unitPrice);
+    let countryCode = 'US';
+
     try {
-      const productRes = await fetch(`${RL_BASE}/products/${productId}`, {
+      const productRes = await fetch(`${RL_BASE}/products/${numericProductId}`, {
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: 'application/com.reloadly.giftcards-v1+json',
         },
       });
-      const productData = await productRes.json();
+      const pd = await productRes.json();
+      console.log('Product from Reloadly:', JSON.stringify(pd).slice(0, 600));
 
-      // Find matching denomination
-      if (productData.fixedRecipientDenominations) {
-        const denoms = productData.fixedRecipientDenominations;
-        // Find closest denomination to requested price
-        const match = denoms.find(d => Math.abs(d - unitPrice) < 0.5);
-        if (match) finalUnitPrice = match;
-        else finalUnitPrice = denoms[0]; // fallback to first
-      } else if (productData.fixedSenderDenominations) {
-        const denoms = productData.fixedSenderDenominations;
-        const match = denoms.find(d => Math.abs(d - unitPrice) < 0.5);
-        if (match) finalUnitPrice = match;
-        else finalUnitPrice = denoms[0];
+      if (pd.countryCode) countryCode = pd.countryCode;
+      else if (pd.country?.isoName) countryCode = pd.country.isoName;
+
+      const requested = parseFloat(unitPrice);
+      if (pd.fixedRecipientDenominations?.length) {
+        const match = pd.fixedRecipientDenominations.find(d => Math.abs(d - requested) < 1);
+        finalUnitPrice = match !== undefined ? match : pd.fixedRecipientDenominations[0];
+      } else if (pd.fixedSenderDenominations?.length) {
+        const match = pd.fixedSenderDenominations.find(d => Math.abs(d - requested) < 1);
+        finalUnitPrice = match !== undefined ? match : pd.fixedSenderDenominations[0];
       }
     } catch (e) {
-      console.log('Could not fetch product denominations, using provided price:', e.message);
+      console.log('Product fetch error:', e.message);
     }
+
+    const payload = {
+      productId: numericProductId,
+      countryCode,
+      quantity: parseInt(quantity),
+      unitPrice: finalUnitPrice,
+      customIdentifier: `bc-${Date.now()}`,
+      senderName: 'BridgeCards',
+      recipientEmail,
+    };
+
+    console.log('SENDING TO RELOADLY:', JSON.stringify(payload));
 
     const orderRes = await fetch(`${RL_BASE}/orders`, {
       method: 'POST',
@@ -147,25 +144,18 @@ app.post('/api/order', async (req, res) => {
         Accept: 'application/com.reloadly.giftcards-v1+json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        productId,
-        quantity,
-        unitPrice: finalUnitPrice,
-        customIdentifier: `bc-${Date.now()}`,
-        recipientEmail,
-        senderName: 'BridgeCards',
-      }),
+      body: JSON.stringify(payload),
     });
 
     const order = await orderRes.json();
-    console.log('Reloadly order response:', JSON.stringify(order));
+    console.log('RELOADLY RESPONSE:', JSON.stringify(order));
     res.json(order);
   } catch (e) {
+    console.log('ORDER ERROR:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Get products list
 app.get('/api/products', async (req, res) => {
   try {
     const token = await getToken();
