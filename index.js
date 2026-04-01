@@ -29,13 +29,13 @@ async function getToken() {
     }),
   });
   const d = await res.json();
-  if (!d.access_token) throw new Error('Reloadly auth failed');
+  if (!d.access_token) throw new Error('Reloadly auth failed: ' + JSON.stringify(d));
   return d.access_token;
 }
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', sandbox: SANDBOX });
 });
 
 // Stripe publishable key
@@ -72,6 +72,23 @@ app.post('/api/create-payment-intent', async (req, res) => {
   }
 });
 
+// Get product denominations from Reloadly (to get correct unitPrice)
+app.get('/api/product/:id/denominations', async (req, res) => {
+  try {
+    const token = await getToken();
+    const response = await fetch(`${RL_BASE}/products/${req.params.id}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/com.reloadly.giftcards-v1+json',
+      },
+    });
+    const product = await response.json();
+    res.json(product);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Place Reloadly order
 app.post('/api/order', async (req, res) => {
   try {
@@ -81,7 +98,7 @@ app.post('/api/order', async (req, res) => {
       return res.status(400).json({ error: 'Missing fields' });
     }
 
-    // Verify Stripe payment
+    // Verify Stripe payment if provided
     if (paymentIntentId) {
       const piRes = await fetch(
         `https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
@@ -94,6 +111,35 @@ app.post('/api/order', async (req, res) => {
     }
 
     const token = await getToken();
+
+    // Get correct unitPrice from Reloadly
+    let finalUnitPrice = unitPrice;
+    try {
+      const productRes = await fetch(`${RL_BASE}/products/${productId}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/com.reloadly.giftcards-v1+json',
+        },
+      });
+      const productData = await productRes.json();
+
+      // Find matching denomination
+      if (productData.fixedRecipientDenominations) {
+        const denoms = productData.fixedRecipientDenominations;
+        // Find closest denomination to requested price
+        const match = denoms.find(d => Math.abs(d - unitPrice) < 0.5);
+        if (match) finalUnitPrice = match;
+        else finalUnitPrice = denoms[0]; // fallback to first
+      } else if (productData.fixedSenderDenominations) {
+        const denoms = productData.fixedSenderDenominations;
+        const match = denoms.find(d => Math.abs(d - unitPrice) < 0.5);
+        if (match) finalUnitPrice = match;
+        else finalUnitPrice = denoms[0];
+      }
+    } catch (e) {
+      console.log('Could not fetch product denominations, using provided price:', e.message);
+    }
+
     const orderRes = await fetch(`${RL_BASE}/orders`, {
       method: 'POST',
       headers: {
@@ -104,20 +150,22 @@ app.post('/api/order', async (req, res) => {
       body: JSON.stringify({
         productId,
         quantity,
-        unitPrice,
+        unitPrice: finalUnitPrice,
         customIdentifier: `bc-${Date.now()}`,
         recipientEmail,
         senderName: 'BridgeCards',
       }),
     });
+
     const order = await orderRes.json();
+    console.log('Reloadly order response:', JSON.stringify(order));
     res.json(order);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Get products
+// Get products list
 app.get('/api/products', async (req, res) => {
   try {
     const token = await getToken();
