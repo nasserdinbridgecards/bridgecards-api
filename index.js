@@ -158,7 +158,8 @@ app.post('/api/create-payment-intent', rateLimit, async (req, res) => {
     log('INFO', 'CREATE_PAYMENT_INTENT', { amount, currency, email, productId });
     if (!amount) return res.status(400).json({ error: 'amount required' });
 
-    // منع البيع بخسارة
+    // منع البيع بخسارة مع هامش ربح قابل للضبط
+    const MIN_PROFIT_MARGIN = parseFloat(process.env.MIN_PROFIT_MARGIN || '0.03'); // 3% افتراضي
     if (!SANDBOX && productId) {
       try {
         const token = await getToken();
@@ -172,11 +173,19 @@ app.post('/api/create-payment-intent', rateLimit, async (req, res) => {
         const reloadlyCost = pd.fixedRecipientDenominations?.[0] || pd.fixedSenderDenominations?.[0];
         if (reloadlyCost) {
           const stripeFee = (amount * 0.029) + 0.30;
-          const totalCost = reloadlyCost + stripeFee;
-          log('INFO', 'PROFIT_CHECK', { sellPrice: amount, reloadlyCost, stripeFee: stripeFee.toFixed(2), totalCost: totalCost.toFixed(2) });
-          if (amount <= totalCost) {
-            log('WARN', 'LOSS_PREVENTED', { sellPrice: amount, totalCost });
-            return res.status(400).json({ error: 'السعر غير متاح حالياً، يرجى المحاولة لاحقاً' });
+          const minProfit = reloadlyCost * MIN_PROFIT_MARGIN;
+          const totalRequired = reloadlyCost + stripeFee + minProfit;
+          log('INFO', 'PROFIT_CHECK', {
+            sellPrice: amount,
+            reloadlyCost,
+            stripeFee: stripeFee.toFixed(2),
+            minProfit: minProfit.toFixed(2),
+            totalRequired: totalRequired.toFixed(2),
+            margin: (MIN_PROFIT_MARGIN * 100).toFixed(0) + '%'
+          });
+          if (amount < totalRequired) {
+            log('WARN', 'LOSS_PREVENTED', { sellPrice: amount, totalRequired, shortfall: (totalRequired - amount).toFixed(2) });
+            return res.status(400).json({ error: 'المنتج غير متاح مؤقتاً' });
           }
         }
       } catch (e) {
