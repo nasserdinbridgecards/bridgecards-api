@@ -575,7 +575,21 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
   const orderId = generateId();
   let order     = null;
   try {
-    const { productId, quantity, paymentMethod, paymentIntentId, userEmail } = req.body;
+    let {
+      productId,
+      quantity,
+      paymentMethod,
+      paymentIntentId,
+      userEmail,
+      product_id,
+      productID,
+      qty,
+      count,
+    } = req.body;
+
+    // Accept common frontend key variants to avoid false "Missing fields"
+    productId = productId ?? product_id ?? productID ?? null;
+    quantity  = quantity  ?? qty ?? count ?? null;
     // NOTE: unitPrice from frontend is IGNORED — server recalculates
 
     // Resolve identity from JWT
@@ -586,7 +600,21 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       if (p) { customerEmail=p.email; userId=p.userId; }
     }
     if (!customerEmail) return res.status(400).json({error:'Authentication required'});
-    if (!productId||!quantity) return res.status(400).json({error:'Missing fields'});
+
+    // Recovery path: if frontend missed productId/quantity but PI metadata has them
+    if ((!productId || !quantity) && paymentIntentId && STRIPE_SECRET) {
+      try {
+        const piMetaRes = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
+          { headers: { Authorization: `Bearer ${STRIPE_SECRET}` } });
+        const piMeta = await piMetaRes.json();
+        productId = productId ?? piMeta?.metadata?.product_id ?? null;
+        quantity  = quantity  ?? piMeta?.metadata?.quantity ?? 1;
+      } catch (e) {
+        log('WARN','PI_METADATA_READ_FAILED',{orderId,paymentIntentId,error:e.message});
+      }
+    }
+
+    if (!productId || !quantity) return res.status(400).json({error:'Missing fields'});
 
     log('INFO','ORDER_START',{orderId,productId,quantity,customerEmail});
 
@@ -1001,13 +1029,14 @@ app.post('/api/check-product', rateLimit(5,60000), async (req,res) => {
 
 app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
   try {
-    const {amount,currency='usd',email,productId}=req.body;
+    const {amount,currency='usd',email,productId,quantity}=req.body;
     if (!amount) return res.status(400).json({error:'amount required'});
     const body=new URLSearchParams({
       amount:String(Math.round(amount*100)), currency,
       'payment_method_types[]':'card',
       'metadata[customer_email]':email||'',
       'metadata[product_id]':productId||'',
+      'metadata[quantity]':String(quantity||1),
     });
     const r=await fetch('https://api.stripe.com/v1/payment_intents',{
       method:'POST',
