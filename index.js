@@ -587,6 +587,9 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       count,
       product,
       item,
+      cart,
+      cartItems,
+      items,
       selectedProduct,
       selectedQuantity,
     } = req.body;
@@ -599,6 +602,12 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       ?? product?.id
       ?? item?.productId
       ?? item?.id
+      ?? cart?.[0]?.productId
+      ?? cart?.[0]?.id
+      ?? cartItems?.[0]?.productId
+      ?? cartItems?.[0]?.id
+      ?? items?.[0]?.productId
+      ?? items?.[0]?.id
       ?? selectedProduct?.productId
       ?? selectedProduct?.id
       ?? null;
@@ -607,6 +616,9 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       ?? count
       ?? product?.quantity
       ?? item?.quantity
+      ?? cart?.[0]?.quantity
+      ?? cartItems?.[0]?.quantity
+      ?? items?.[0]?.quantity
       ?? selectedQuantity
       ?? null;
     // NOTE: unitPrice from frontend is IGNORED — server recalculates
@@ -1058,6 +1070,9 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
       selectedProductId,
       product,
       item,
+      cart,
+      cartItems,
+      items,
       selectedProduct,
       quantity,
       qty,
@@ -1073,10 +1088,25 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
       ?? product?.id
       ?? item?.productId
       ?? item?.id
+      ?? cart?.[0]?.productId
+      ?? cart?.[0]?.id
+      ?? cartItems?.[0]?.productId
+      ?? cartItems?.[0]?.id
+      ?? items?.[0]?.productId
+      ?? items?.[0]?.id
       ?? selectedProduct?.productId
       ?? selectedProduct?.id
       ?? '';
-    const resolvedQuantity = quantity ?? qty ?? count ?? product?.quantity ?? item?.quantity ?? selectedQuantity ?? 1;
+    const resolvedQuantity = quantity
+      ?? qty
+      ?? count
+      ?? product?.quantity
+      ?? item?.quantity
+      ?? cart?.[0]?.quantity
+      ?? cartItems?.[0]?.quantity
+      ?? items?.[0]?.quantity
+      ?? selectedQuantity
+      ?? 1;
     const body=new URLSearchParams({
       amount:String(Math.round(amount*100)), currency,
       'payment_method_types[]':'card',
