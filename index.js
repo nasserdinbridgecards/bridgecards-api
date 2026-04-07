@@ -660,7 +660,17 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       }
     }
 
-    if (!productId || !quantity) return res.status(400).json({error:'Missing fields'});
+    if (!productId || !quantity) {
+      const missing = [];
+      if (!productId) missing.push('productId');
+      if (!quantity) missing.push('quantity');
+      return res.status(400).json({
+        error:'Missing fields',
+        missing,
+        paymentIntentIdResolved: resolvedPaymentIntentId || null,
+        hint: 'Send productId/quantity directly or include a payment intent reference so metadata fallback can recover them.',
+      });
+    }
 
     log('INFO','ORDER_START',{orderId,productId,quantity,customerEmail});
 
