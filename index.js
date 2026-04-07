@@ -61,6 +61,7 @@ async function dbInit() {
       userId: String, email: String,
       productId: String, productName: String,
       quantity: Number, unitPrice: Number, totalAmount: Number,
+      invoiceNo: String, invoiceIssuedAt: String,
       paymentMethod: String, paymentIntentId: String,
       status: { type: String, default: 'pending', index: true },
       codes: [String], reloadlyOrderId: String,
@@ -437,6 +438,40 @@ font-family:monospace;font-size:20px;font-weight:900;letter-spacing:4px;color:#0
 <div class="ft">BridgeCards · Zetony LLC (USA) · <a href="mailto:${ADMIN_EMAIL}" style="color:#00d4aa">${ADMIN_EMAIL}</a></div>
 </div></body></html>`;
 
+function generateInvoiceNo(orderId) {
+  const ym = new Date().toISOString().slice(0, 7).replace('-', '');
+  const tail = orderId.split('-').slice(-1)[0] || crypto.randomBytes(2).toString('hex').toUpperCase();
+  return `INV-${ym}-${tail}`;
+}
+
+function invoiceHtml(order) {
+  const issued = order.invoiceIssuedAt || new Date().toISOString();
+  return tpl('🧾 Invoice / فاتورة', `
+    <div class="r"><span>Invoice</span><span>${order.invoiceNo}</span></div>
+    <div class="r"><span>Issued</span><span>${new Date(issued).toLocaleString('en-US')}</span></div>
+    <div class="r"><span>Order</span><span>${order.id}</span></div>
+    <div class="r"><span>Email</span><span>${order.email}</span></div>
+    <div class="r"><span>Product</span><span>${order.productName}</span></div>
+    <div class="r"><span>Qty</span><span>${order.quantity}</span></div>
+    <div class="r"><span>Unit</span><span>$${order.unitPrice.toFixed(2)}</span></div>
+    <div class="r"><span>Total</span><span>$${order.totalAmount.toFixed(2)}</span></div>
+    <p style="font-size:12px;color:#9294b8;margin-top:10px;">For accounting support, reply to this email.</p>`);
+}
+
+async function issueInvoice(order) {
+  if (order.invoiceNo) return order;
+  order.invoiceNo = generateInvoiceNo(order.id);
+  order.invoiceIssuedAt = new Date().toISOString();
+  await dbSetOrder(order.id, order);
+  await sendEmail({
+    to: order.email,
+    subject: `🧾 Invoice ${order.invoiceNo} — BridgeCards`,
+    html: invoiceHtml(order),
+  });
+  log('INFO', 'INVOICE_SENT', { orderId: order.id, invoiceNo: order.invoiceNo, to: order.email });
+  return order;
+}
+
 // ═══════════════════════════════════════════════════════
 // ── ROUTES ──
 // ═══════════════════════════════════════════════════════
@@ -540,7 +575,21 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
   const orderId = generateId();
   let order     = null;
   try {
-    const { productId, quantity, paymentMethod, paymentIntentId, userEmail } = req.body;
+    let {
+      productId,
+      quantity,
+      paymentMethod,
+      paymentIntentId,
+      userEmail,
+      product_id,
+      productID,
+      qty,
+      count,
+    } = req.body;
+
+    // Accept common frontend key variants to avoid false "Missing fields"
+    productId = productId ?? product_id ?? productID ?? null;
+    quantity  = quantity  ?? qty ?? count ?? null;
     // NOTE: unitPrice from frontend is IGNORED — server recalculates
 
     // Resolve identity from JWT
@@ -551,7 +600,21 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       if (p) { customerEmail=p.email; userId=p.userId; }
     }
     if (!customerEmail) return res.status(400).json({error:'Authentication required'});
-    if (!productId||!quantity) return res.status(400).json({error:'Missing fields'});
+
+    // Recovery path: if frontend missed productId/quantity but PI metadata has them
+    if ((!productId || !quantity) && paymentIntentId && STRIPE_SECRET) {
+      try {
+        const piMetaRes = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
+          { headers: { Authorization: `Bearer ${STRIPE_SECRET}` } });
+        const piMeta = await piMetaRes.json();
+        productId = productId ?? piMeta?.metadata?.product_id ?? null;
+        quantity  = quantity  ?? piMeta?.metadata?.quantity ?? 1;
+      } catch (e) {
+        log('WARN','PI_METADATA_READ_FAILED',{orderId,paymentIntentId,error:e.message});
+      }
+    }
+
+    if (!productId || !quantity) return res.status(400).json({error:'Missing fields'});
 
     log('INFO','ORDER_START',{orderId,productId,quantity,customerEmail});
 
@@ -606,9 +669,10 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
             refundMessage:'Please try again — no charge was made'});
         }
         log('WARN','PRICE_CALC_WARN',{error:e.message});
-        // For non-Reloadly products or failures: fall back to frontend price with validation
-        serverUnitPrice = parseFloat(req.body.unitPrice || 0);
-        if (serverUnitPrice <= 0) return res.status(400).json({error:'Invalid price'});
+        return res.status(503).json({
+          error:'Live supplier pricing unavailable. Please retry in a moment.',
+          orderId,
+        });
       }
     } else {
       // Non-Reloadly (manual/crypto) — use frontend price but validate minimum
@@ -663,6 +727,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       order.status='paid';
     }
     await dbSetOrder(orderId,order);
+    await issueInvoice(order);
 
     // Confirmation email
     sendEmail({to:customerEmail, subject:`✅ Order Confirmed #${orderId} — BridgeCards`,
@@ -774,7 +839,14 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       }).catch(()=>{});
     }
 
-    res.json({...rlData,orderId,paymentStatus:'succeeded',orderStatus:'SUCCESSFUL',status:'SUCCESSFUL'});
+    res.json({
+      ...rlData,
+      orderId,
+      invoiceNo: order.invoiceNo,
+      paymentStatus:'succeeded',
+      orderStatus:'SUCCESSFUL',
+      status:'SUCCESSFUL',
+    });
 
   } catch(e) {
     log('ERROR','ORDER_ERR',{orderId,error:e.message});
@@ -796,6 +868,15 @@ app.get('/orders/user/:id', auth, async (req,res) => {
   if (!o) return res.status(404).json({error:'Order not found'});
   if (o.userId!==req.user.userId&&o.email!==req.user.email) return res.status(403).json({error:'Forbidden'});
   res.json(o);
+});
+
+app.get('/orders/user/:id/invoice', auth, async (req,res) => {
+  const o = await dbGetOrder(req.params.id);
+  if (!o) return res.status(404).json({error:'Order not found'});
+  if (o.userId!==req.user.userId&&o.email!==req.user.email) return res.status(403).json({error:'Forbidden'});
+  if (!o.invoiceNo) return res.status(404).json({error:'Invoice not generated yet'});
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(invoiceHtml(o));
 });
 
 app.get('/orders/admin', admin, async (req,res) => {
@@ -948,13 +1029,14 @@ app.post('/api/check-product', rateLimit(5,60000), async (req,res) => {
 
 app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
   try {
-    const {amount,currency='usd',email,productId}=req.body;
+    const {amount,currency='usd',email,productId,quantity}=req.body;
     if (!amount) return res.status(400).json({error:'amount required'});
     const body=new URLSearchParams({
       amount:String(Math.round(amount*100)), currency,
       'payment_method_types[]':'card',
       'metadata[customer_email]':email||'',
       'metadata[product_id]':productId||'',
+      'metadata[quantity]':String(quantity||1),
     });
     const r=await fetch('https://api.stripe.com/v1/payment_intents',{
       method:'POST',
