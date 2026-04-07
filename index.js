@@ -580,6 +580,12 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       quantity,
       paymentMethod,
       paymentIntentId,
+      payment_intent_id,
+      paymentIntentID,
+      intentId,
+      paymentIntent,
+      clientSecret,
+      paymentIntentClientSecret,
       userEmail,
       product_id,
       productID,
@@ -593,6 +599,15 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       selectedProduct,
       selectedQuantity,
     } = req.body;
+    const resolvedPaymentIntentId = paymentIntentId
+      ?? payment_intent_id
+      ?? paymentIntentID
+      ?? intentId
+      ?? paymentIntent?.id
+      ?? (typeof paymentIntent === 'string' ? paymentIntent : null)
+      ?? (typeof clientSecret === 'string' ? clientSecret.split('_secret_')[0] : null)
+      ?? (typeof paymentIntentClientSecret === 'string' ? paymentIntentClientSecret.split('_secret_')[0] : null)
+      ?? null;
 
     // Accept common frontend key variants to avoid false "Missing fields"
     productId = productId
@@ -633,15 +648,15 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
     if (!customerEmail) return res.status(400).json({error:'Authentication required'});
 
     // Recovery path: if frontend missed productId/quantity but PI metadata has them
-    if ((!productId || !quantity) && paymentIntentId && STRIPE_SECRET) {
+    if ((!productId || !quantity) && resolvedPaymentIntentId && STRIPE_SECRET) {
       try {
-        const piMetaRes = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
+        const piMetaRes = await fetch(`https://api.stripe.com/v1/payment_intents/${resolvedPaymentIntentId}`,
           { headers: { Authorization: `Bearer ${STRIPE_SECRET}` } });
         const piMeta = await piMetaRes.json();
         productId = productId ?? piMeta?.metadata?.product_id ?? null;
         quantity  = quantity  ?? piMeta?.metadata?.quantity ?? 1;
       } catch (e) {
-        log('WARN','PI_METADATA_READ_FAILED',{orderId,paymentIntentId,error:e.message});
+        log('WARN','PI_METADATA_READ_FAILED',{orderId,paymentIntentId:resolvedPaymentIntentId,error:e.message});
       }
     }
 
@@ -719,18 +734,18 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       productId, productName, quantity:parseInt(quantity),
       unitPrice:serverUnitPrice, totalAmount,
       paymentMethod:paymentMethod||'unknown',
-      paymentIntentId:paymentIntentId||null,
+      paymentIntentId:resolvedPaymentIntentId||null,
       status:'pending', codes:[], reloadlyOrderId:null,
       createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), error:null,
     };
     await dbSetOrder(orderId, order);
 
     // Validate Stripe payment amount against SERVER price
-    if (paymentIntentId && STRIPE_SECRET) {
-      const piRes = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}`,
+    if (resolvedPaymentIntentId && STRIPE_SECRET) {
+      const piRes = await fetch(`https://api.stripe.com/v1/payment_intents/${resolvedPaymentIntentId}`,
         {headers:{Authorization:`Bearer ${STRIPE_SECRET}`}});
       const pi = await piRes.json();
-      log('INFO','PI_STATUS',{id:paymentIntentId,status:pi.status,amount:pi.amount});
+      log('INFO','PI_STATUS',{id:resolvedPaymentIntentId,status:pi.status,amount:pi.amount});
 
       if (pi.status !== 'succeeded') {
         order.status='failed'; order.error='Payment not confirmed';
@@ -747,7 +762,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
         if (pi.amount < expected - tolerance) {
           order.status='failed'; order.error='Underpayment detected';
           await dbSetOrder(orderId,order);
-          await stripeRefund(paymentIntentId,'fraudulent');
+          await stripeRefund(resolvedPaymentIntentId,'fraudulent');
           return res.status(400).json({error:'Payment amount mismatch',orderId,refunded:true});
         }
         // Overpayment: accept and log (rare — may happen with FX rounding)
@@ -826,8 +841,8 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
     if (rlData.errorCode||rlData.status==='FAILED'||(rlData.message&&!rlData.transactions)) {
       order.status='failed'; order.error=rlData.message||rlData.errorCode||'ORDER_FAILED';
       let refundDone=false;
-      if (paymentIntentId) {
-        const rf = await stripeRefund(paymentIntentId,order.error);
+      if (resolvedPaymentIntentId) {
+        const rf = await stripeRefund(resolvedPaymentIntentId,order.error);
         refundDone = rf?.status==='succeeded';
         if (refundDone) order.status='refunded';
       }
@@ -882,7 +897,16 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
   } catch(e) {
     log('ERROR','ORDER_ERR',{orderId,error:e.message});
     if (order){order.status='failed';order.error=e.message;await dbSetOrder(orderId,order);}
-    if (req.body.paymentIntentId) await stripeRefund(req.body.paymentIntentId,'server_error');
+    const failPiId = req.body.paymentIntentId
+      ?? req.body.payment_intent_id
+      ?? req.body.paymentIntentID
+      ?? req.body.intentId
+      ?? req.body.paymentIntent?.id
+      ?? (typeof req.body.paymentIntent === 'string' ? req.body.paymentIntent : null)
+      ?? (typeof req.body.clientSecret === 'string' ? req.body.clientSecret.split('_secret_')[0] : null)
+      ?? (typeof req.body.paymentIntentClientSecret === 'string' ? req.body.paymentIntentClientSecret.split('_secret_')[0] : null)
+      ?? null;
+    if (failPiId) await stripeRefund(failPiId,'server_error');
     if (e.message==='TIMEOUT')
       return res.status(503).json({error:'Service unavailable',orderId,refunded:true});
     res.status(500).json({error:e.message,orderId});
