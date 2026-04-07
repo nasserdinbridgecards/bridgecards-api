@@ -1055,8 +1055,10 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
       productId,
       product_id,
       productID,
+      selectedProductId,
       product,
       item,
+      selectedProduct,
       quantity,
       qty,
       count,
@@ -1066,10 +1068,13 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
     const resolvedProductId = productId
       ?? product_id
       ?? productID
+      ?? selectedProductId
       ?? product?.productId
       ?? product?.id
       ?? item?.productId
       ?? item?.id
+      ?? selectedProduct?.productId
+      ?? selectedProduct?.id
       ?? '';
     const resolvedQuantity = quantity ?? qty ?? count ?? product?.quantity ?? item?.quantity ?? selectedQuantity ?? 1;
     const body=new URLSearchParams({
