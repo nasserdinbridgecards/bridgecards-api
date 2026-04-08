@@ -8,6 +8,12 @@ const app = express();
 app.use('/api/stripe-webhook', express.raw({ type: 'application/json' }));
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use((req,res,next) => {
+  const incoming = req.headers['x-request-id'];
+  req.requestId = (typeof incoming === 'string' && incoming.trim()) ? incoming.trim() : crypto.randomUUID();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
 
 // ═══════════════════════════════════════════════════════
 // ENVIRONMENT
@@ -27,6 +33,8 @@ const MIN_MARGIN      = parseFloat(process.env.MIN_PROFIT_MARGIN || '0.12');
 const STRIPE_FEE_PCT  = 0.029;
 const STRIPE_FEE_FLAT = 0.30;
 const MONGODB_URI     = process.env.MONGODB_URI    || '';
+const APP_VERSION     = process.env.APP_VERSION || '3.0.0';
+const APP_COMMIT      = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown';
 
 const RL_BASE = SANDBOX
   ? 'https://giftcards-sandbox.reloadly.com'
@@ -476,8 +484,14 @@ async function issueInvoice(order) {
 // ── ROUTES ──
 // ═══════════════════════════════════════════════════════
 
-app.get('/api/health', (req,res) => res.json({ status:'ok', sandbox:SANDBOX, version:'3.0.0',
-  db: db?.isMongoose ? 'mongodb' : 'in-memory' }));
+app.get('/api/health', (req,res) => res.json({
+  status:'ok',
+  sandbox:SANDBOX,
+  version:APP_VERSION,
+  commit:APP_COMMIT,
+  requestId:req.requestId,
+  db: db?.isMongoose ? 'mongodb' : 'in-memory',
+}));
 
 app.get('/api/stripe-key', (req,res) => res.json({ publishableKey:STRIPE_PUB }));
 
@@ -645,7 +659,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       const p = jwtVerify(authH.slice(7));
       if (p) { customerEmail=p.email; userId=p.userId; }
     }
-    if (!customerEmail) return res.status(400).json({error:'Authentication required'});
+    if (!customerEmail) return res.status(400).json({error:'Authentication required', requestId:req.requestId});
 
     // Recovery path: if frontend missed productId/quantity but PI metadata has them
     if ((!productId || !quantity) && resolvedPaymentIntentId && STRIPE_SECRET) {
@@ -668,11 +682,12 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
         error:'Missing fields',
         missing,
         paymentIntentIdResolved: resolvedPaymentIntentId || null,
+        requestId:req.requestId,
         hint: 'Send productId/quantity directly or include a payment intent reference so metadata fallback can recover them.',
       });
     }
 
-    log('INFO','ORDER_START',{orderId,productId,quantity,customerEmail});
+    log('INFO','ORDER_START',{requestId:req.requestId,orderId,productId,quantity,customerEmail});
 
     if (isDuplicate(customerEmail,productId))
       return res.status(429).json({error:'Duplicate order — please wait 30 seconds'});
@@ -760,7 +775,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       if (pi.status !== 'succeeded') {
         order.status='failed'; order.error='Payment not confirmed';
         await dbSetOrder(orderId,order);
-        return res.status(402).json({error:order.error,orderId});
+        return res.status(402).json({error:order.error,orderId,requestId:req.requestId});
       }
 
       // Compare Stripe amount vs server-calculated amount (allow ±$1 tolerance)
@@ -773,7 +788,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
           order.status='failed'; order.error='Underpayment detected';
           await dbSetOrder(orderId,order);
           await stripeRefund(resolvedPaymentIntentId,'fraudulent');
-          return res.status(400).json({error:'Payment amount mismatch',orderId,refunded:true});
+          return res.status(400).json({error:'Payment amount mismatch',orderId,refunded:true,requestId:req.requestId});
         }
         // Overpayment: accept and log (rare — may happen with FX rounding)
         log('INFO','OVERPAYMENT_ACCEPTED',{extra:pi.amount-expected});
@@ -863,6 +878,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       }).catch(()=>{});
       return res.status(400).json({orderId,paymentStatus:'succeeded',orderStatus:'FAILED',
         error:'Card purchase failed',refunded:refundDone,
+        requestId:req.requestId,
         refundMessage:refundDone?'✅ Refund initiated — 3–5 business days'
                                 :'⚠️ Contact support@bridgecards.org'});
     }
@@ -899,6 +915,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       ...rlData,
       orderId,
       invoiceNo: order.invoiceNo,
+      requestId: req.requestId,
       paymentStatus:'succeeded',
       orderStatus:'SUCCESSFUL',
       status:'SUCCESSFUL',
@@ -918,8 +935,8 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       ?? null;
     if (failPiId) await stripeRefund(failPiId,'server_error');
     if (e.message==='TIMEOUT')
-      return res.status(503).json({error:'Service unavailable',orderId,refunded:true});
-    res.status(500).json({error:e.message,orderId});
+      return res.status(503).json({error:'Service unavailable',orderId,refunded:true,requestId:req.requestId});
+    res.status(500).json({error:e.message,orderId,requestId:req.requestId});
   }
 });
 
@@ -1113,7 +1130,7 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
       count,
       selectedQuantity,
     }=req.body;
-    if (!amount) return res.status(400).json({error:'amount required'});
+    if (!amount) return res.status(400).json({error:'amount required',requestId:req.requestId});
     const resolvedProductId = productId
       ?? product_id
       ?? productID
@@ -1155,8 +1172,8 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
     });
     const pi=await r.json();
     if (pi.error) throw new Error(pi.error.message);
-    res.json({clientSecret:pi.client_secret,id:pi.id});
-  } catch(e){res.status(500).json({error:e.message});}
+    res.json({clientSecret:pi.client_secret,id:pi.id,requestId:req.requestId});
+  } catch(e){res.status(500).json({error:e.message,requestId:req.requestId});}
 });
 
 // ═══════════════════════════════════════════════════════
