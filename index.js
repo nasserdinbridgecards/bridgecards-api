@@ -8,6 +8,12 @@ const app = express();
 app.use('/api/stripe-webhook', express.raw({ type: 'application/json' }));
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use((req,res,next) => {
+  const incoming = req.headers['x-request-id'];
+  req.requestId = (typeof incoming === 'string' && incoming.trim()) ? incoming.trim() : crypto.randomUUID();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
 
 // ═══════════════════════════════════════════════════════
 // ENVIRONMENT
@@ -27,6 +33,8 @@ const MIN_MARGIN      = parseFloat(process.env.MIN_PROFIT_MARGIN || '0.12');
 const STRIPE_FEE_PCT  = 0.029;
 const STRIPE_FEE_FLAT = 0.30;
 const MONGODB_URI     = process.env.MONGODB_URI    || '';
+const APP_VERSION     = process.env.APP_VERSION || '3.0.0';
+const APP_COMMIT      = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown';
 
 const RL_BASE = SANDBOX
   ? 'https://giftcards-sandbox.reloadly.com'
@@ -34,7 +42,6 @@ const RL_BASE = SANDBOX
 
 // ═══════════════════════════════════════════════════════
 // DATABASE LAYER — in-memory with MongoDB drop-in
-// Set MONGODB_URI env var to switch to persistent storage
 // ═══════════════════════════════════════════════════════
 let db = null;
 
@@ -45,7 +52,6 @@ async function dbInit() {
     return;
   }
   try {
-    // Dynamic import so server starts without mongoose installed
     const { default: mongoose } = await import('mongoose');
 
     const UserSchema = new mongoose.Schema({
@@ -82,7 +88,6 @@ async function dbInit() {
   }
 }
 
-// Unified DB interface — works with both in-memory and MongoDB
 const memUsers  = new Map();
 const memOrders = new Map();
 
@@ -121,10 +126,8 @@ async function dbAllUsers() {
   return [...memUsers.values()];
 }
 
-// Blocked IPs store
 const blockedIPs = new Set();
 
-// Settings store (always in-memory — OK for settings)
 const settings = {
   globalMargin:    MIN_MARGIN,
   fxBuffer:        0.03,
@@ -133,7 +136,6 @@ const settings = {
   maintenanceMode: false,
 };
 
-// Admin product overrides
 const productConfigs = new Map();
 
 // ═══════════════════════════════════════════════════════
@@ -151,7 +153,7 @@ function log(level, action, data = {}) {
 }
 
 // ═══════════════════════════════════════════════════════
-// LIVE FX RATES (fetched server-side every 60 min)
+// LIVE FX RATES
 // ═══════════════════════════════════════════════════════
 const FALLBACK_FX = {
   USD:1, EUR:1.12, GBP:1.32, CAD:0.76, AUD:0.68,
@@ -187,14 +189,7 @@ setInterval(() => getLiveFX().catch(() => {}), 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════
 // SERVER-SIDE PRICING ENGINE
-// The ONLY place prices are calculated. Frontend never trusted.
 // ═══════════════════════════════════════════════════════
-
-/**
- * Correct Stripe formula — gross you must charge so that after Stripe
- * takes its cut you have exactly (cost + margin) left:
- *   gross = (desiredNet + FLAT) / (1 - PCT)
- */
 function calcPrice(costUSD, marginOverride = null) {
   const margin     = marginOverride ?? settings.globalMargin;
   const desiredNet = costUSD * (1 + margin);
@@ -209,10 +204,6 @@ function calcPrice(costUSD, marginOverride = null) {
   };
 }
 
-/**
- * Calculate server-side sell price from Reloadly product data.
- * Returns null if product not found or not ACTIVE.
- */
 async function getServerPrice(reloadlyId, denomination = null) {
   try {
     const token  = await getToken();
@@ -230,15 +221,12 @@ async function getServerPrice(reloadlyId, denomination = null) {
     const margin   = productConfigs.get(String(reloadlyId))?.margin ?? null;
 
     if (denomination !== null) {
-      // Find closest denomination
-      const denom = denoms.find(d => Math.abs(d - denomination) < denomination * 0.1)
-                 ?? denoms[0];
+      const denom = denoms.find(d => Math.abs(d - denomination) < denomination * 0.1) ?? denoms[0];
       if (!denom) return null;
       const costUSD = denom * (1 - discount/100) * rateToUSD;
       return { ...calcPrice(costUSD, margin), denomination: denom, currency, product: pd };
     }
 
-    // Return all denominations
     return {
       productId:   pd.productId,
       productName: pd.productName,
@@ -289,7 +277,6 @@ setInterval(() => {
   }
 }, 300000);
 
-// Duplicate order protection
 const recentOrders = new Map();
 function isDuplicate(email, productId) {
   const key = `${email}:${productId}`, now = Date.now();
@@ -473,11 +460,17 @@ async function issueInvoice(order) {
 }
 
 // ═══════════════════════════════════════════════════════
-// ── ROUTES ──
+// ROUTES
 // ═══════════════════════════════════════════════════════
 
-app.get('/api/health', (req,res) => res.json({ status:'ok', sandbox:SANDBOX, version:'3.0.0',
-  db: db?.isMongoose ? 'mongodb' : 'in-memory' }));
+app.get('/api/health', (req,res) => res.json({
+  status:'ok',
+  sandbox:SANDBOX,
+  version:APP_VERSION,
+  commit:APP_COMMIT,
+  requestId:req.requestId,
+  db: db?.isMongoose ? 'mongodb' : 'in-memory',
+}));
 
 app.get('/api/stripe-key', (req,res) => res.json({ publishableKey:STRIPE_PUB }));
 
@@ -498,8 +491,7 @@ app.get('/api/availability', (req,res) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// SERVER-SIDE PRICE ENDPOINT — frontend fetches this
-// instead of calculating locally. Prevents price tampering.
+// SERVER-SIDE PRICE ENDPOINT
 // ═══════════════════════════════════════════════════════
 app.post('/api/price', rateLimit(20,60000), async (req,res) => {
   const { productId, denomination } = req.body;
@@ -575,21 +567,51 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
   const orderId = generateId();
   let order     = null;
   try {
-    let {
-      productId,
-      quantity,
+    const {
       paymentMethod,
-      paymentIntentId,
       userEmail,
-      product_id,
-      productID,
-      qty,
-      count,
     } = req.body;
 
-    // Accept common frontend key variants to avoid false "Missing fields"
-    productId = productId ?? product_id ?? productID ?? null;
-    quantity  = quantity  ?? qty ?? count ?? null;
+    // Accept common frontend key variants
+    let productId = req.body.productId
+      ?? req.body.product_id
+      ?? req.body.productID
+      ?? req.body.product?.productId
+      ?? req.body.product?.id
+      ?? req.body.item?.productId
+      ?? req.body.item?.id
+      ?? req.body.cart?.[0]?.productId
+      ?? req.body.cart?.[0]?.id
+      ?? req.body.cartItems?.[0]?.productId
+      ?? req.body.cartItems?.[0]?.id
+      ?? req.body.items?.[0]?.productId
+      ?? req.body.items?.[0]?.id
+      ?? req.body.selectedProduct?.productId
+      ?? req.body.selectedProduct?.id
+      ?? null;
+
+    let quantity = req.body.quantity
+      ?? req.body.qty
+      ?? req.body.count
+      ?? req.body.product?.quantity
+      ?? req.body.item?.quantity
+      ?? req.body.cart?.[0]?.quantity
+      ?? req.body.cartItems?.[0]?.quantity
+      ?? req.body.items?.[0]?.quantity
+      ?? req.body.selectedQuantity
+      ?? null;
+
+    // Resolve paymentIntentId from multiple possible keys
+    const paymentIntentId = req.body.paymentIntentId
+      ?? req.body.payment_intent_id
+      ?? req.body.paymentIntentID
+      ?? req.body.intentId
+      ?? req.body.paymentIntent?.id
+      ?? (typeof req.body.paymentIntent === 'string' ? req.body.paymentIntent : null)
+      ?? (typeof req.body.clientSecret === 'string' ? req.body.clientSecret.split('_secret_')[0] : null)
+      ?? (typeof req.body.paymentIntentClientSecret === 'string' ? req.body.paymentIntentClientSecret.split('_secret_')[0] : null)
+      ?? null;
+
     // NOTE: unitPrice from frontend is IGNORED — server recalculates
 
     // Resolve identity from JWT
@@ -599,7 +621,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       const p = jwtVerify(authH.slice(7));
       if (p) { customerEmail=p.email; userId=p.userId; }
     }
-    if (!customerEmail) return res.status(400).json({error:'Authentication required'});
+    if (!customerEmail) return res.status(400).json({error:'Authentication required', requestId:req.requestId});
 
     // Recovery path: if frontend missed productId/quantity but PI metadata has them
     if ((!productId || !quantity) && paymentIntentId && STRIPE_SECRET) {
@@ -614,15 +636,25 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       }
     }
 
-    if (!productId || !quantity) return res.status(400).json({error:'Missing fields'});
+    if (!productId || !quantity) {
+      const missing = [];
+      if (!productId) missing.push('productId');
+      if (!quantity) missing.push('quantity');
+      return res.status(400).json({
+        error:'Missing fields',
+        missing,
+        paymentIntentIdResolved: paymentIntentId || null,
+        requestId:req.requestId,
+        hint: 'Send productId/quantity directly or include a payment intent reference so metadata fallback can recover them.',
+      });
+    }
 
-    log('INFO','ORDER_START',{orderId,productId,quantity,customerEmail});
+    log('INFO','ORDER_START',{requestId:req.requestId,orderId,productId,quantity,customerEmail});
 
     if (isDuplicate(customerEmail,productId))
       return res.status(429).json({error:'Duplicate order — please wait 30 seconds'});
 
     // ── SERVER-SIDE PRICE CALCULATION ──────────────────
-    // Frontend price is NEVER used. We recalculate from Reloadly.
     const numId = parseInt(productId);
     let serverUnitPrice = null;
     let countryCode     = 'US';
@@ -649,7 +681,6 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
         const rateToUSD = rates[currency] ?? FALLBACK_FX[currency] ?? 1;
         const margin    = productConfigs.get(String(numId))?.margin ?? null;
 
-        // Pick denomination: use frontend hint but verify against Reloadly list
         const frontendDenom = parseFloat(req.body.unitPrice || 0);
         const matched = denoms.find(d => Math.abs(d - frontendDenom) < frontendDenom * 0.1)
                      ?? denoms[0];
@@ -659,7 +690,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
         const pricing = calcPrice(costUSD, margin);
         serverUnitPrice = pricing.sell;
 
-        log('INFO','Server-calculated price (trusted)',{
+        log('INFO','SERVER_PRICE',{
           orderId, product:productName, denom:matched, currency,
           costUSD:pricing.cost.toFixed(2), sell:serverUnitPrice, profit:pricing.profit,
         });
@@ -682,7 +713,6 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
 
     const totalAmount = parseFloat((serverUnitPrice * parseInt(quantity)).toFixed(2));
 
-    // Create order with SERVER-calculated price
     order = {
       id:orderId, userId, email:customerEmail,
       productId, productName, quantity:parseInt(quantity),
@@ -704,22 +734,19 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       if (pi.status !== 'succeeded') {
         order.status='failed'; order.error='Payment not confirmed';
         await dbSetOrder(orderId,order);
-        return res.status(402).json({error:order.error,orderId});
+        return res.status(402).json({error:order.error,orderId,requestId:req.requestId});
       }
 
-      // Compare Stripe amount vs server-calculated amount (allow ±$1 tolerance)
       const expected  = Math.round(totalAmount * 100);
-      const tolerance = 100; // $1.00 tolerance for rounding
+      const tolerance = 100;
       if (Math.abs(pi.amount - expected) > tolerance) {
         log('WARN','AMOUNT_MISMATCH',{piAmount:pi.amount,expected,diff:pi.amount-expected,orderId});
-        // If underpaid by more than tolerance — refund and reject
         if (pi.amount < expected - tolerance) {
           order.status='failed'; order.error='Underpayment detected';
           await dbSetOrder(orderId,order);
           await stripeRefund(paymentIntentId,'fraudulent');
-          return res.status(400).json({error:'Payment amount mismatch',orderId,refunded:true});
+          return res.status(400).json({error:'Payment amount mismatch',orderId,refunded:true,requestId:req.requestId});
         }
-        // Overpayment: accept and log (rare — may happen with FX rounding)
         log('INFO','OVERPAYMENT_ACCEPTED',{extra:pi.amount-expected});
       }
       order.status='paid';
@@ -729,7 +756,6 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
     await dbSetOrder(orderId,order);
     await issueInvoice(order);
 
-    // Confirmation email
     sendEmail({to:customerEmail, subject:`✅ Order Confirmed #${orderId} — BridgeCards`,
       html:tpl('✅ Order Received',`
         <div class="r"><span>Order</span><span>${orderId}</span></div>
@@ -751,18 +777,15 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
 
     if (!rlToken) rlToken = await getToken();
 
-    // Re-fetch denomination for Reloadly order (use server-verified value)
     const pdRes2 = await fetchWT(`${RL_BASE}/products/${numId}`,{
       headers:{Authorization:`Bearer ${rlToken}`,Accept:'application/com.reloadly.giftcards-v1+json'},
     });
     const pd2 = await pdRes2.json();
     const denoms2 = pd2.fixedSenderDenominations || pd2.fixedRecipientDenominations || [];
-    // Closest denomination by cost ratio
     const rates2 = await getLiveFX();
     const cur2   = pd2.fixedSenderCurrencyCode||pd2.senderCurrencyCode||'USD';
     const r2usd  = rates2[cur2]??1;
     const disc2  = pd2.discountPercentage||0;
-    // Find which Reloadly denomination corresponds to our server price
     let bestDenom = denoms2[0];
     let bestDiff  = Infinity;
     for (const d of denoms2) {
@@ -791,7 +814,6 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
     const rlData  = await rlRes.json();
     log('INFO','RL_RESPONSE',{status:rlData.status,error:rlData.errorCode});
 
-    // Failure → auto refund
     if (rlData.errorCode||rlData.status==='FAILED'||(rlData.message&&!rlData.transactions)) {
       order.status='failed'; order.error=rlData.message||rlData.errorCode||'ORDER_FAILED';
       let refundDone=false;
@@ -807,6 +829,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       }).catch(()=>{});
       return res.status(400).json({orderId,paymentStatus:'succeeded',orderStatus:'FAILED',
         error:'Card purchase failed',refunded:refundDone,
+        requestId:req.requestId,
         refundMessage:refundDone?'✅ Refund initiated — 3–5 business days'
                                 :'⚠️ Contact support@bridgecards.org'});
     }
@@ -822,7 +845,6 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
     ).filter(Boolean);
     await dbSetOrder(orderId,order);
 
-    // Update user stats
     const u = await dbGetUser(customerEmail);
     if (u) {
       u.orderCount=(u.orderCount||0)+1;
@@ -843,6 +865,7 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
       ...rlData,
       orderId,
       invoiceNo: order.invoiceNo,
+      requestId: req.requestId,
       paymentStatus:'succeeded',
       orderStatus:'SUCCESSFUL',
       status:'SUCCESSFUL',
@@ -851,10 +874,19 @@ app.post('/orders', rateLimit(5,60000), async (req,res) => {
   } catch(e) {
     log('ERROR','ORDER_ERR',{orderId,error:e.message});
     if (order){order.status='failed';order.error=e.message;await dbSetOrder(orderId,order);}
-    if (req.body.paymentIntentId) await stripeRefund(req.body.paymentIntentId,'server_error');
+    const failPiId = req.body.paymentIntentId
+      ?? req.body.payment_intent_id
+      ?? req.body.paymentIntentID
+      ?? req.body.intentId
+      ?? req.body.paymentIntent?.id
+      ?? (typeof req.body.paymentIntent === 'string' ? req.body.paymentIntent : null)
+      ?? (typeof req.body.clientSecret === 'string' ? req.body.clientSecret.split('_secret_')[0] : null)
+      ?? (typeof req.body.paymentIntentClientSecret === 'string' ? req.body.paymentIntentClientSecret.split('_secret_')[0] : null)
+      ?? null;
+    if (failPiId) await stripeRefund(failPiId,'server_error');
     if (e.message==='TIMEOUT')
-      return res.status(503).json({error:'Service unavailable',orderId,refunded:true});
-    res.status(500).json({error:e.message,orderId});
+      return res.status(503).json({error:'Service unavailable',orderId,refunded:true,requestId:req.requestId});
+    res.status(500).json({error:e.message,orderId,requestId:req.requestId});
   }
 });
 
@@ -1029,14 +1061,45 @@ app.post('/api/check-product', rateLimit(5,60000), async (req,res) => {
 
 app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
   try {
-    const {amount,currency='usd',email,productId,quantity}=req.body;
-    if (!amount) return res.status(400).json({error:'amount required'});
+    const { amount, currency='usd', email } = req.body;
+    if (!amount) return res.status(400).json({error:'amount required', requestId:req.requestId});
+
+    // Accept multiple frontend key variants for productId and quantity
+    const productId = req.body.productId
+      ?? req.body.product_id
+      ?? req.body.productID
+      ?? req.body.selectedProductId
+      ?? req.body.product?.productId
+      ?? req.body.product?.id
+      ?? req.body.item?.productId
+      ?? req.body.item?.id
+      ?? req.body.cart?.[0]?.productId
+      ?? req.body.cart?.[0]?.id
+      ?? req.body.cartItems?.[0]?.productId
+      ?? req.body.cartItems?.[0]?.id
+      ?? req.body.items?.[0]?.productId
+      ?? req.body.items?.[0]?.id
+      ?? req.body.selectedProduct?.productId
+      ?? req.body.selectedProduct?.id
+      ?? '';
+
+    const quantity = req.body.quantity
+      ?? req.body.qty
+      ?? req.body.count
+      ?? req.body.product?.quantity
+      ?? req.body.item?.quantity
+      ?? req.body.cart?.[0]?.quantity
+      ?? req.body.cartItems?.[0]?.quantity
+      ?? req.body.items?.[0]?.quantity
+      ?? req.body.selectedQuantity
+      ?? 1;
+
     const body=new URLSearchParams({
       amount:String(Math.round(amount*100)), currency,
       'payment_method_types[]':'card',
       'metadata[customer_email]':email||'',
-      'metadata[product_id]':productId||'',
-      'metadata[quantity]':String(quantity||1),
+      'metadata[product_id]':String(productId),
+      'metadata[quantity]':String(quantity),
     });
     const r=await fetch('https://api.stripe.com/v1/payment_intents',{
       method:'POST',
@@ -1045,8 +1108,8 @@ app.post('/api/create-payment-intent', rateLimit(5,60000), async (req,res) => {
     });
     const pi=await r.json();
     if (pi.error) throw new Error(pi.error.message);
-    res.json({clientSecret:pi.client_secret,id:pi.id});
-  } catch(e){res.status(500).json({error:e.message});}
+    res.json({clientSecret:pi.client_secret, id:pi.id, requestId:req.requestId});
+  } catch(e){res.status(500).json({error:e.message, requestId:req.requestId});}
 });
 
 // ═══════════════════════════════════════════════════════
@@ -1069,6 +1132,6 @@ const PORT=process.env.PORT||3000;
 app.listen(PORT, async () => {
   await dbInit();
   await seedAdmin();
-  log('INFO','STARTED',{port:PORT,sandbox:SANDBOX,version:'3.0.0',
+  log('INFO','STARTED',{port:PORT,sandbox:SANDBOX,version:APP_VERSION,
     db:db?.isMongoose?'mongodb':'in-memory'});
 });
