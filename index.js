@@ -48,14 +48,17 @@ async function start() {
   await initDb();
   await seedAdmin();
 
-  app.listen(PORT, () => {
-    const db = getDbHandle();
-    log('INFO', 'STARTED', {
-      port:    PORT,
-      sandbox: SANDBOX,
-      version: '3.1.0',
-      db:      db?.isMongoose ? 'mongodb' : 'in-memory',
-    });
+  await new Promise((resolve, reject) => {
+    const server = app.listen(PORT, resolve);
+    server.on('error', reject);
+  });
+
+  const db = getDbHandle();
+  log('INFO', 'STARTED', {
+    port:    PORT,
+    sandbox: SANDBOX,
+    version: '3.1.0',
+    db:      db?.isMongoose ? 'mongodb' : 'in-memory',
   });
 }
 

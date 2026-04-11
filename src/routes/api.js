@@ -154,7 +154,7 @@ router.post('/stripe-webhook', async (req, res) => {
       const adminEmail = ADMIN_EMAIL;
       sendEmail({
         to:      adminEmail,
-        subject: `⚠️ CHARGEBACK: ${escapeHtml(dispute.charge)}`,
+        subject: `⚠️ CHARGEBACK: ${dispute.charge}`,
         html:    emailTemplate('⚠️ Chargeback', `
           <div class="r"><span>Charge</span><span>${escapeHtml(dispute.charge)}</span></div>
           <div class="r"><span>Amount</span><span>$${(dispute.amount / 100).toFixed(2)}</span></div>

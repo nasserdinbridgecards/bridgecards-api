@@ -104,12 +104,12 @@ export function generateInvoiceNo(orderId) {
 export function invoiceHtml(order) {
   const issued = order.invoiceIssuedAt || new Date().toISOString();
   return emailTemplate('🧾 Invoice / فاتورة', `
-    <div class="r"><span>Invoice</span><span>${order.invoiceNo}</span></div>
-    <div class="r"><span>Issued</span><span>${new Date(issued).toLocaleString('en-US')}</span></div>
-    <div class="r"><span>Order</span><span>${order.id}</span></div>
-    <div class="r"><span>Email</span><span>${order.email}</span></div>
-    <div class="r"><span>Product</span><span>${order.productName}</span></div>
-    <div class="r"><span>Qty</span><span>${order.quantity}</span></div>
+    <div class="r"><span>Invoice</span><span>${escapeHtml(order.invoiceNo)}</span></div>
+    <div class="r"><span>Issued</span><span>${escapeHtml(new Date(issued).toLocaleString('en-US'))}</span></div>
+    <div class="r"><span>Order</span><span>${escapeHtml(order.id)}</span></div>
+    <div class="r"><span>Email</span><span>${escapeHtml(order.email)}</span></div>
+    <div class="r"><span>Product</span><span>${escapeHtml(order.productName)}</span></div>
+    <div class="r"><span>Qty</span><span>${escapeHtml(String(order.quantity))}</span></div>
     <div class="r"><span>Unit</span><span>$${order.unitPrice.toFixed(2)}</span></div>
     <div class="r"><span>Total</span><span>$${order.totalAmount.toFixed(2)}</span></div>
     <p style="font-size:12px;color:#9294b8;margin-top:10px;">

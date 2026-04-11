@@ -1,12 +1,24 @@
 import { STRIPE_SECRET } from '../config.js';
 import { log } from '../utils/logger.js';
 
+/** Stripe PaymentIntent IDs follow the pattern pi_<alphanumeric>. */
+const PI_ID_RE = /^pi_[A-Za-z0-9]+$/;
+
+/**
+ * Validate that a string looks like a Stripe PaymentIntent ID.
+ * Rejects obviously malformed values before they reach the Stripe URL.
+ */
+function validatePaymentIntentId(id) {
+  if (!id || !PI_ID_RE.test(id)) throw new Error(`Invalid PaymentIntent ID: ${id}`);
+}
+
 /**
  * Retrieve a Stripe PaymentIntent.
  * Returns the PaymentIntent object or null when Stripe is not configured.
  */
 export async function getPaymentIntent(paymentIntentId) {
   if (!paymentIntentId || !STRIPE_SECRET) return null;
+  validatePaymentIntentId(paymentIntentId);
   const res = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}`, {
     headers: { Authorization: `Bearer ${STRIPE_SECRET}` },
   });
@@ -48,6 +60,7 @@ export async function createPaymentIntent({ amount, currency = 'usd', email, pro
 export async function stripeRefund(paymentIntentId, reason = 'other') {
   if (!paymentIntentId || !STRIPE_SECRET) return null;
   try {
+    validatePaymentIntentId(paymentIntentId);
     const res = await fetch('https://api.stripe.com/v1/refunds', {
       method:  'POST',
       headers: {
