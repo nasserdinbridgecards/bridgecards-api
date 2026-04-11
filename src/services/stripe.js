@@ -31,19 +31,22 @@ export async function getPaymentIntent(paymentIntentId) {
  * @param {{ amount: number, currency: string, email: string, productId: string, quantity: number }} params
  * @returns {{ clientSecret: string, id: string }}
  */
-export async function createPaymentIntent({ amount, currency = 'usd', email, productId, quantity = 1 }) {
+export async function createPaymentIntent({ amount, currency = 'usd', email, productId, quantity = 1, metadata = {} }) {
   const body = new URLSearchParams({
-    amount:                          String(Math.round(amount * 100)),
+    amount: String(Math.round(amount * 100)),
     currency,
-    'payment_method_types[]':        'card',
-    'metadata[customer_email]':      email || '',
-    'metadata[product_id]':          productId || '',
-    'metadata[quantity]':            String(quantity),
+    'payment_method_types[]': 'card',
+    'metadata[customer_email]': email || '',
+    'metadata[product_id]': productId || '',
+    'metadata[quantity]': String(quantity),
   });
+  for (const [key, value] of Object.entries(metadata)) {
+    body.append(`metadata[${key}]`, String(value ?? ''));
+  }
   const res = await fetch('https://api.stripe.com/v1/payment_intents', {
-    method:  'POST',
+    method: 'POST',
     headers: {
-      Authorization:  `Bearer ${STRIPE_SECRET}`,
+      Authorization: `Bearer ${STRIPE_SECRET}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body,
@@ -62,9 +65,9 @@ export async function stripeRefund(paymentIntentId, reason = 'other') {
   try {
     validatePaymentIntentId(paymentIntentId);
     const res = await fetch('https://api.stripe.com/v1/refunds', {
-      method:  'POST',
+      method: 'POST',
       headers: {
-        Authorization:  `Bearer ${STRIPE_SECRET}`,
+        Authorization: `Bearer ${STRIPE_SECRET}`,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ payment_intent: paymentIntentId, reason }),

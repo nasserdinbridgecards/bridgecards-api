@@ -1,13 +1,14 @@
 import express from 'express';
-import cors    from 'cors';
-import helmet  from 'helmet';
+import cors from 'cors';
+import helmet from 'helmet';
 
-import apiRouter    from './routes/api.js';
-import authRouter   from './routes/auth.js';
+import apiRouter from './routes/api.js';
+import authRouter from './routes/auth.js';
 import ordersRouter from './routes/orders.js';
-import adminRouter  from './routes/admin.js';
+import adminRouter from './routes/admin.js';
 import { log } from './utils/logger.js';
 import { rateLimit } from './middleware/rateLimit.js';
+import { CORS_ORIGIN } from './config.js';
 
 const app = express();
 
@@ -16,8 +17,8 @@ app.use(helmet());
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 // Allow all origins in development; restrict in production via CORS_ORIGIN env var.
-const corsOptions = process.env.CORS_ORIGIN
-  ? { origin: process.env.CORS_ORIGIN, credentials: true }
+const corsOptions = CORS_ORIGIN
+  ? { origin: CORS_ORIGIN, credentials: true }
   : {};
 app.use(cors(corsOptions));
 
@@ -31,10 +32,10 @@ app.use(express.json({ limit: '2mb' }));
 app.use(rateLimit(120, 60_000));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/api',    apiRouter);
-app.use('/auth',   authRouter);
+app.use('/api', apiRouter);
+app.use('/auth', authRouter);
 app.use('/orders', ordersRouter);
-app.use('/admin',  adminRouter);
+app.use('/admin', adminRouter);
 
 // ── Global error handler ──────────────────────────────────────────────────────
 // Catches any unhandled errors propagated via next(err).

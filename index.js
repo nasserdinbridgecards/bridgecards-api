@@ -10,32 +10,24 @@
  */
 
 import crypto from 'crypto';
-import app          from './src/app.js';
+import app from './src/app.js';
 import { initDb, getDbHandle, dbGetUser, dbSetUser } from './src/db/index.js';
-import { PORT, SANDBOX, ADMIN_EMAIL } from './src/config.js';
+import { PORT, SANDBOX, ADMIN_EMAIL, ADMIN_PASSWORD, validateRuntimeConfig } from './src/config.js';
 import { log } from './src/utils/logger.js';
 import { hashPassword } from './src/utils/crypto.js';
-
-// Re-export ADMIN_PASSWORD from config with a sensible default if not set.
-const adminPass = process.env.ADMIN_PASSWORD || 'Admin@BridgeCards2026!';
-if (!process.env.ADMIN_PASSWORD) {
-  log('WARN', 'ADMIN_PASSWORD_DEFAULT', {
-    msg: 'ADMIN_PASSWORD not set — using insecure default. Set ADMIN_PASSWORD in production.',
-  });
-}
 
 async function seedAdmin() {
   const email = ADMIN_EMAIL.toLowerCase();
   if (!await dbGetUser(email)) {
     await dbSetUser(email, {
-      id:         crypto.randomUUID(),
-      firstName:  'Admin',
-      lastName:   'BridgeCards',
+      id: crypto.randomUUID(),
+      firstName: 'Admin',
+      lastName: 'BridgeCards',
       email,
-      password:   await hashPassword(adminPass),
-      role:       'admin',
-      createdAt:  new Date().toISOString(),
-      isBlocked:  false,
+      password: await hashPassword(ADMIN_PASSWORD),
+      role: 'admin',
+      createdAt: new Date().toISOString(),
+      isBlocked: false,
       orderCount: 0,
       totalSpent: 0,
     });
@@ -44,6 +36,8 @@ async function seedAdmin() {
 }
 
 async function start() {
+  validateRuntimeConfig();
+
   // Initialise DB first so no requests can hit uninitialised storage.
   await initDb();
   await seedAdmin();
@@ -55,10 +49,10 @@ async function start() {
 
   const db = getDbHandle();
   log('INFO', 'STARTED', {
-    port:    PORT,
+    port: PORT,
     sandbox: SANDBOX,
     version: '3.1.0',
-    db:      db?.isMongoose ? 'mongodb' : 'in-memory',
+    db: db?.isMongoose ? 'mongodb' : 'unavailable',
   });
 }
 

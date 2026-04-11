@@ -1,5 +1,5 @@
-import { Router }     from 'express';
-import { admin }       from '../middleware/auth.js';
+import { Router } from 'express';
+import { admin } from '../middleware/auth.js';
 import { log, getRecentFraudAlerts } from '../utils/logger.js';
 import { dbAllOrders, dbAllUsers, dbGetUser, dbSetUser, getDbHandle } from '../db/index.js';
 import { settings, productConfigs, blockedIPs } from '../store.js';
@@ -9,39 +9,41 @@ const router = Router();
 
 // GET /admin/stats
 router.get('/stats', admin, async (req, res) => {
-  const [orders, users, fxRates] = await Promise.all([
+  const [orders, users, fxRates, fraudAlerts] = await Promise.all([
     dbAllOrders({}),
     dbAllUsers(),
     getLiveFX(),
+    getRecentFraudAlerts(20),
   ]);
   const { updatedAt } = getFxCacheInfo();
-  const delivered     = orders.filter((o) => o.status === 'delivered');
+  const delivered = orders.filter((o) => o.status === 'delivered');
 
   return res.json({
-    totalOrders:       orders.length,
-    totalUsers:        users.length,
-    totalRevenue:      delivered.reduce((sum, o) => sum + o.totalAmount, 0).toFixed(2),
-    estimatedProfit:   delivered.reduce((sum, o) => sum + o.totalAmount * settings.globalMargin, 0).toFixed(2),
-    failed:            orders.filter((o) => o.status === 'failed').length,
-    refunded:          orders.filter((o) => o.status === 'refunded').length,
-    pending:           orders.filter((o) => ['pending', 'processing'].includes(o.status)).length,
+    totalOrders: orders.length,
+    totalUsers: users.length,
+    totalRevenue: delivered.reduce((sum, o) => sum + o.totalAmount, 0).toFixed(2),
+    estimatedProfit: delivered.reduce((sum, o) => sum + o.totalAmount * settings.globalMargin, 0).toFixed(2),
+    failed: orders.filter((o) => o.status === 'failed').length,
+    refunded: orders.filter((o) => o.status === 'refunded').length,
+    pending: orders.filter((o) => ['pending_payment', 'pending', 'processing'].includes(o.status)).length,
     byStatus: {
-      pending:    orders.filter((o) => o.status === 'pending').length,
-      paid:       orders.filter((o) => o.status === 'paid').length,
+      pendingPayment: orders.filter((o) => o.status === 'pending_payment').length,
+      pending: orders.filter((o) => o.status === 'pending').length,
+      paid: orders.filter((o) => o.status === 'paid').length,
       processing: orders.filter((o) => o.status === 'processing').length,
-      delivered:  delivered.length,
-      failed:     orders.filter((o) => o.status === 'failed').length,
-      refunded:   orders.filter((o) => o.status === 'refunded').length,
+      delivered: delivered.length,
+      failed: orders.filter((o) => o.status === 'failed').length,
+      refunded: orders.filter((o) => o.status === 'refunded').length,
     },
     fxRates,
-    fxUpdatedAt:  new Date(updatedAt).toISOString(),
-    dbType:       getDbHandle()?.isMongoose ? 'mongodb' : 'in-memory',
-    fraudAlerts:  getRecentFraudAlerts(20),
+    fxUpdatedAt: new Date(updatedAt).toISOString(),
+    dbType: getDbHandle()?.isMongoose ? 'mongodb' : 'unavailable',
+    fraudAlerts,
     recentOrders: orders.slice(0, 10).map((o) => ({
-      id:        o.id,
-      email:     o.email,
-      status:    o.status,
-      amount:    o.totalAmount,
+      id: o.id,
+      email: o.email,
+      status: o.status,
+      amount: o.totalAmount,
       createdAt: o.createdAt,
     })),
   });
@@ -58,7 +60,7 @@ router.patch('/users/:email', admin, async (req, res) => {
   const user = await dbGetUser(req.params.email);
   if (!user) return res.status(404).json({ error: 'User not found' });
   if (req.body.isBlocked !== undefined) user.isBlocked = req.body.isBlocked;
-  if (req.body.role)                    user.role      = req.body.role;
+  if (req.body.role) user.role = req.body.role;
   await dbSetUser(req.params.email, user);
   const { password: _, ...safeUser } = user;
   return res.json(safeUser);
@@ -91,8 +93,8 @@ router.patch('/settings', admin, (req, res) => {
 
 // PATCH /admin/products/:id
 router.patch('/products/:id', admin, (req, res) => {
-  const { id }  = req.params;
-  const cfg     = productConfigs.get(id) || { id };
+  const { id } = req.params;
+  const cfg = productConfigs.get(id) || { id };
   const allowed = ['enabled', 'availability', 'margin'];
   for (const key of allowed) {
     if (req.body[key] !== undefined) cfg[key] = req.body[key];

@@ -8,8 +8,9 @@ import { getLiveFX, getFxCacheInfo } from '../services/fx.js';
 import { getServerPrice, fetchProduct, getReloadlyToken } from '../services/reloadly.js';
 import { calcPrice } from '../services/pricing.js';
 import { createPaymentIntent } from '../services/stripe.js';
-import { sendEmail, emailTemplate, escapeHtml } from '../services/email.js';
-import { getDbHandle } from '../db/index.js';
+import { sendEmail, emailTemplate, escapeHtml, issueInvoice } from '../services/email.js';
+import { buildOrderDraft } from '../services/orderFlow.js';
+import { getDbHandle, dbGetOrder, dbGetOrderByPaymentIntent, dbSetOrder } from '../db/index.js';
 import { fetchWithTimeout } from '../utils/fetch.js';
 
 const router = Router();
@@ -18,10 +19,10 @@ const router = Router();
 router.get('/health', (req, res) => {
   const db = getDbHandle();
   res.json({
-    status:  'ok',
+    status: 'ok',
     sandbox: SANDBOX,
     version: '3.1.0',
-    db:      db?.isMongoose ? 'mongodb' : 'in-memory',
+    db: db?.isMongoose ? 'mongodb' : 'unavailable',
   });
 });
 
@@ -76,10 +77,10 @@ router.post('/price', rateLimit(20, 60_000), async (req, res) => {
 router.get('/products', async (req, res) => {
   try {
     const token = await getReloadlyToken();
-    const r     = await fetchWithTimeout(`${RL_BASE}/products?size=200`, {
+    const r = await fetchWithTimeout(`${RL_BASE}/products?size=200`, {
       headers: {
         Authorization: `Bearer ${token}`,
-        Accept:        'application/com.reloadly.giftcards-v1+json',
+        Accept: 'application/com.reloadly.giftcards-v1+json',
       },
     });
     const data = await r.json();
@@ -117,22 +118,107 @@ router.post('/check-product', rateLimit(5, 60_000), async (req, res) => {
 // POST /api/create-payment-intent
 router.post('/create-payment-intent', rateLimit(5, 60_000), async (req, res) => {
   try {
-    const { amount, currency, email, productId, quantity } = req.body;
-    if (!amount) return res.status(400).json({ error: 'amount required' });
-    const result = await createPaymentIntent({ amount, currency, email, productId, quantity });
-    return res.json(result);
+    const { amount, currency, email, productId, quantity, paymentMethod, unitPrice } = req.body;
+    if (!email || !productId || !quantity) {
+      return res.status(400).json({ error: 'email, productId, and quantity are required' });
+    }
+
+    const unitPriceHint = unitPrice ?? ((amount && quantity) ? Number(amount) / Number(quantity) : null);
+    const order = await buildOrderDraft({
+      customerEmail: email.toLowerCase().trim(),
+      productId,
+      quantity,
+      paymentMethod: paymentMethod || 'card',
+      unitPriceHint,
+    });
+
+    await dbSetOrder(order.id, order);
+
+    try {
+      const result = await createPaymentIntent({
+        amount: order.totalAmount,
+        currency,
+        email: order.email,
+        productId: order.productId,
+        quantity: order.quantity,
+        metadata: {
+          order_id: order.id,
+          unit_price: order.unitPrice,
+        },
+      });
+
+      order.paymentIntentId = result.id;
+      order.updatedAt = new Date().toISOString();
+      await dbSetOrder(order.id, order);
+
+      return res.json({
+        ...result,
+        orderId: order.id,
+        amount: order.totalAmount,
+      });
+    } catch (err) {
+      order.status = 'failed';
+      order.error = `Payment intent creation failed: ${err.message}`;
+      order.updatedAt = new Date().toISOString();
+      await dbSetOrder(order.id, order);
+      throw err;
+    }
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
+async function getOrderForPaymentIntent(paymentIntent) {
+  const orderId = paymentIntent?.metadata?.order_id;
+  if (orderId) {
+    const order = await dbGetOrder(orderId);
+    if (order) return order;
+  }
+  return dbGetOrderByPaymentIntent(paymentIntent.id);
+}
+
+async function handlePaymentIntentSucceeded(paymentIntent) {
+  const order = await getOrderForPaymentIntent(paymentIntent);
+  if (!order) {
+    log('WARN', 'WEBHOOK_ORDER_NOT_FOUND', { paymentIntentId: paymentIntent.id, event: 'payment_intent.succeeded' });
+    return;
+  }
+  if (['delivered', 'processing', 'paid'].includes(order.status)) return;
+
+  order.paymentIntentId = paymentIntent.id;
+  order.status = 'paid';
+  order.error = null;
+  order.updatedAt = new Date().toISOString();
+  await dbSetOrder(order.id, order);
+  await issueInvoice(order);
+  log('INFO', 'WEBHOOK_PAYMENT_SUCCEEDED', { orderId: order.id, paymentIntentId: paymentIntent.id });
+}
+
+async function handlePaymentIntentFailed(paymentIntent) {
+  const order = await getOrderForPaymentIntent(paymentIntent);
+  if (!order) {
+    log('WARN', 'WEBHOOK_ORDER_NOT_FOUND', { paymentIntentId: paymentIntent.id, event: 'payment_intent.payment_failed' });
+    return;
+  }
+
+  order.paymentIntentId = paymentIntent.id;
+  order.status = 'failed';
+  order.error = paymentIntent.last_payment_error?.message || 'Payment failed';
+  order.updatedAt = new Date().toISOString();
+  await dbSetOrder(order.id, order);
+  log('WARN', 'WEBHOOK_PAYMENT_FAILED', {
+    orderId: order.id,
+    paymentIntentId: paymentIntent.id,
+    error: order.error,
+  });
+}
+
 // POST /api/stripe-webhook
 router.post('/stripe-webhook', async (req, res) => {
-  if (!STRIPE_WEBHOOK) return res.json({ received: true });
   try {
     const sig = req.headers['stripe-signature'];
-    const ts  = sig.match(/t=(\d+)/)?.[1]  || '0';
-    const v1  = sig.match(/v1=([a-f0-9]+)/)?.[1] || '';
+    const ts = sig.match(/t=(\d+)/)?.[1] || '0';
+    const v1 = sig.match(/v1=([a-f0-9]+)/)?.[1] || '';
     const expected = crypto
       .createHmac('sha256', STRIPE_WEBHOOK)
       .update(`${ts}.${req.body}`)
@@ -144,7 +230,11 @@ router.post('/stripe-webhook', async (req, res) => {
     }
 
     const event = JSON.parse(req.body.toString());
-    if (event.type === 'charge.dispute.created') {
+    if (event.type === 'payment_intent.succeeded') {
+      await handlePaymentIntentSucceeded(event.data.object);
+    } else if (event.type === 'payment_intent.payment_failed') {
+      await handlePaymentIntentFailed(event.data.object);
+    } else if (event.type === 'charge.dispute.created') {
       const dispute = event.data.object;
       log('WARN', 'CHARGEBACK', {
         charge: dispute.charge,
@@ -153,13 +243,13 @@ router.post('/stripe-webhook', async (req, res) => {
       });
       const adminEmail = ADMIN_EMAIL;
       sendEmail({
-        to:      adminEmail,
+        to: adminEmail,
         subject: `⚠️ CHARGEBACK: ${dispute.charge}`,
-        html:    emailTemplate('⚠️ Chargeback', `
+        html: emailTemplate('⚠️ Chargeback', `
           <div class="r"><span>Charge</span><span>${escapeHtml(dispute.charge)}</span></div>
           <div class="r"><span>Amount</span><span>$${(dispute.amount / 100).toFixed(2)}</span></div>
           <div class="r"><span>Reason</span><span>${escapeHtml(dispute.reason)}</span></div>`, '#ff4f7b'),
-      }).catch(() => {});
+      }).catch(() => { });
     }
     return res.json({ received: true });
   } catch (err) {
